@@ -1,4 +1,4 @@
-import type { TransformedData } from "./services/base-service";
+import type { MetadataContext, TransformedData } from "./services/base-service";
 import { useSettingsDialog } from "../../../utils/dialog";
 import { getString } from "../../../utils/locale";
 import { getPref } from "../../../utils/prefs";
@@ -31,22 +31,48 @@ export const ToolUpdateMetadata = defineRule<UpdateMetadataOption>({
       return;
     }
 
-    // 2. get available metadata services, request metadata and clean data
-    let data: TransformedData | null = null;
-    let errorMessage: string = "";
-    for (const service of services) {
-      const ctx = {
+    function createServiceContext(serviceId: string): MetadataContext {
+      return {
         item,
         identifiers,
-        debug: (msg: string) => debug(`[${service.id}] ${msg}`),
+        debug: (msg: string) => debug(`[${serviceId}] ${msg}`),
       };
+    }
 
-      if (!service.shouldApply(ctx))
+    let errorMessage: string = "";
+
+    // 2. get available metadata services
+    const availableServices = services.filter(s => s.shouldApply(createServiceContext(s.id)));
+    debug(`Available services: ${availableServices.map(s => s.id).join(", ")}`);
+
+    // 3. update identidiers
+    for (const service of availableServices) {
+      if (!service.updateIdentifiers)
         continue;
 
-      debug(`Service ${service.name} processing...`);
+      const ctx = createServiceContext(service.id);
+      debug(`Updating identidiers via service ${service.name}...`);
+      const status = await service.updateIdentifiers?.(ctx)
+        .catch((error) => {
+          debug(`Failed to update identifiers via ${service.name}: ${error.message}`);
+          errorMessage += `${service.name}: ${error.message}\n`;
+        });
 
-      await service.updateIdentifiers?.(ctx);
+      // To save resources, we expect that once a service has obtained a general identifier,
+      // it will not attempt further operations.
+      // This can prevent some items that could have been updated via DOI service from being
+      // forced to use a rate-limited semantic scholar service.
+      // When the number of services increases further, we may be able to change this logic.
+      if (status) {
+        break;
+      }
+    }
+
+    // 3. request metadata and clean data
+    let data: TransformedData | null = null;
+    for (const service of services) {
+      const ctx = createServiceContext(service.id);
+      debug(`Service ${service.name} processing...`);
 
       const res = await service.fetch?.(ctx)
         .catch((error) => {
@@ -69,14 +95,20 @@ export const ToolUpdateMetadata = defineRule<UpdateMetadataOption>({
     if (!data) {
       report({
         level: "error",
-        message: `No metadata found. ${errorMessage}`,
+        message: `No metadata found. \n${errorMessage}`,
       });
       return;
+    }
+    else if (errorMessage) {
+      report({
+        level: "warning",
+        message: `Metadata updated with errors:\n\n${errorMessage}`,
+      });
     }
 
     debug("Clean data: ", data);
 
-    // 3. apply field changes
+    // 4. apply field changes
     function applyItemType(data: TransformedData) {
       if (!data.itemType) {
         debug("Service did not provide itemType");
